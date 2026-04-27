@@ -8,6 +8,8 @@ import re
 import time
 from datetime import datetime, timedelta
 
+import threading
+
 import requests
 
 BASE_URL = "https://ayo.co.id"
@@ -79,6 +81,54 @@ def make_session() -> requests.Session:
     except Exception:
         pass
     return s
+
+
+def make_session_bare() -> requests.Session:
+    """Session tanpa homepage hit — aman untuk concurrent use."""
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    return s
+
+
+# ─── Geocoding ────────────────────────────────────────────────────────────────
+
+_geo_lock = threading.Lock()
+_geo_last_call = 0.0
+
+
+def geocode(query: str, limit: int = 5) -> list[dict]:
+    """
+    Cari koordinat dari nama tempat via Nominatim (OpenStreetMap).
+    Returns list of {name, lat, lon, display_name}.
+    Rate-limited 1 req/s sesuai ToS Nominatim.
+    """
+    global _geo_last_call
+    with _geo_lock:
+        elapsed = time.time() - _geo_last_call
+        if elapsed < 1.1:
+            time.sleep(1.1 - elapsed)
+        _geo_last_call = time.time()
+
+    try:
+        r = requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"q": f"{query}, Indonesia", "format": "json",
+                    "limit": limit, "countrycodes": "id"},
+            headers={"User-Agent": "ayo-venue-checker/1.0 (github.com/fassabilf/ayo-venue-checker)"},
+            timeout=8,
+        )
+        items = r.json()
+        return [
+            {
+                "name":         i.get("display_name", "").split(",")[0].strip(),
+                "display_name": i.get("display_name", ""),
+                "lat":          float(i["lat"]),
+                "lon":          float(i["lon"]),
+            }
+            for i in items
+        ]
+    except Exception:
+        return []
 
 
 # ─── Venue list ────────────────────────────────────────────────────────────────
@@ -240,8 +290,13 @@ def check_fields_flexible(
             })
 
         if found:
-            # Pick the one closest to jam_main (prefer exact match)
             best = min(found, key=lambda x: abs(x["slot_start"] - jam_main))
-            results.append(best)
+            alt  = [f for f in found if f is not best]
+            results.append({
+                **best,
+                "field_id":   fid,
+                "field_name": field.get("field_name", "?"),
+                "alt_slots":  alt,   # other valid windows for this field
+            })
 
     return results
