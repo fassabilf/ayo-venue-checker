@@ -199,6 +199,11 @@ def get_all_venues(session: requests.Session, cabor: int,
 
 # ─── Coordinates ──────────────────────────────────────────────────────────────
 
+def fetch_coords_solo(venue: dict) -> dict:
+    """Thread-safe: buat session sendiri, fetch coords satu venue."""
+    return fetch_coords(make_session_bare(), venue)
+
+
 def fetch_coords(session: requests.Session, venue: dict) -> dict:
     if not venue.get("slug"):
         return venue

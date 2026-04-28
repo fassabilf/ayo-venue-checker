@@ -4,7 +4,6 @@ Run: streamlit run app.py
 """
 
 import json
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -17,7 +16,7 @@ from scraper import (
     JAKARTA_AREAS, SPORT_NAMES, DAY_NAMES,
     haversine, next_weekday,
     make_session, make_session_bare, geocode,
-    get_venues_for_area, fetch_coords,
+    get_venues_for_area, fetch_coords_solo,
     check_fields_flexible,
 )
 
@@ -33,96 +32,41 @@ st.set_page_config(
 st.markdown("""
 <style>
   .stApp { max-width: 1400px; margin: auto; }
-  .badge { display:inline-block; padding:3px 10px; border-radius:12px; font-size:12px; font-weight:500; }
-  .badge-green  { background:#e8f5e9; color:#2e7d32; }
-  .badge-yellow { background:#fff3e0; color:#e65100; }
+  .badge { display:inline-block;padding:3px 10px;border-radius:12px;font-size:12px;font-weight:500 }
+  .badge-green  { background:#e8f5e9; color:#2e7d32 }
+  .badge-yellow { background:#fff3e0; color:#e65100 }
 </style>
 """, unsafe_allow_html=True)
 
-# ─── Cached: venue catalog (list + koordinat, TTL 6 jam) ──────────────────────
-# Dipanggil hanya saat user klik "Cari Lapangan", bukan saat page load.
+# ─── Session-state cache helpers ──────────────────────────────────────────────
 
-@st.cache_data(ttl=6 * 3600, show_spinner=False)
-def load_venue_catalog(cabor: int) -> dict:
-    """Fetch semua venue list Jakarta + koordinat. Di-cache 6 jam."""
-    session = make_session()
-    all_venues: list[dict] = []
-    seen: set[int] = set()
-    for lokasi in JAKARTA_AREAS:
-        for v in get_venues_for_area(session, cabor, lokasi):
-            if v["id"] not in seen:
-                seen.add(v["id"])
-                all_venues.append(v)
-        time.sleep(0.2)
-    for i, v in enumerate(all_venues):
-        all_venues[i] = fetch_coords(session, v)
-        time.sleep(0.2)
-    return {
-        "venues":     all_venues,
-        "fetched_at": datetime.now().isoformat(timespec="seconds"),
-        "total":      len(all_venues),
-    }
+def _age_seconds(iso: str) -> float:
+    return (datetime.now() - datetime.fromisoformat(iso)).total_seconds()
 
+def catalog_from_cache(cabor: int):
+    key = f"cat_{cabor}"
+    if key in st.session_state and _age_seconds(st.session_state[key]["at"]) < 6 * 3600:
+        return st.session_state[key]["data"]
+    return None
 
-# ─── Cached: availability check (concurrent, TTL 15 menit) ───────────────────
+def save_catalog(cabor: int, data: dict):
+    st.session_state[f"cat_{cabor}"] = {"data": data, "at": datetime.now().isoformat()}
 
-@st.cache_data(ttl=15 * 60, show_spinner=False)
-def fetch_availability(venues_json: str, date_str: str,
-                       jam_main: int, durasi_x2: int, cabor: int) -> list[dict]:
-    """Cek availability secara concurrent (5 worker). Cached 15 menit."""
-    venues = json.loads(venues_json)
-    durasi = durasi_x2 / 2
-    results: list[dict] = []
-    lock = threading.Lock()
+def avail_from_cache(h: str):
+    key = f"av_{h}"
+    if key in st.session_state and _age_seconds(st.session_state[key]["at"]) < 15 * 60:
+        return st.session_state[key]["data"]
+    return None
 
-    def check_one(v: dict):
-        s = make_session_bare()
-        fields = check_fields_flexible(s, v["id"], date_str, jam_main, durasi, cabor)
-        rows = []
-        for f in fields:
-            url = (f"https://ayo.co.id/v/{v['slug']}?date={date_str}&field_id={f['field_id']}"
-                   if v.get("slug") else f"https://ayo.co.id/venue/{v['id']}")
-            alt_str = ", ".join(
-                f"{a['slot_start']:02d}:00–{a['slot_end']:02d}:00"
-                for a in f.get("alt_slots", [])
-            )
-            rows.append({
-                "venue_id":   v["id"],
-                "venue":      v["name"],
-                "area":       v["area"],
-                "lat":        v["lat"],
-                "lon":        v["lon"],
-                "field_id":   f["field_id"],
-                "field":      f["field_name"],
-                "slot":       f"{f['slot_start']:02d}:00–{f['slot_end']:02d}:00",
-                "slot_start": f["slot_start"],
-                "price":      f["price_total"],
-                "alt_slots":  alt_str,
-                "url":        url,
-            })
-        return rows
+def save_avail(h: str, data: list):
+    st.session_state[f"av_{h}"] = {"data": data, "at": datetime.now().isoformat()}
 
-    with ThreadPoolExecutor(max_workers=5) as ex:
-        futures = [ex.submit(check_one, v) for v in venues]
-        for fut in as_completed(futures):
-            with lock:
-                results.extend(fut.result())
-
-    return results
-
-
-# ─── Session state ────────────────────────────────────────────────────────────
+# ─── Session state init ───────────────────────────────────────────────────────
 
 for k, v in {
-    "ref_lat":     -6.2896,
-    "ref_lon":     106.8400,
-    "ref_name":    "Pasar Minggu",
-    "available":   None,
-    "all_venues":  [],
-    "search_done": False,
-    "last_search": {},
-    "geo_results": [],
-    "catalog_info": None,   # {"fetched_at", "total"}
+    "ref_lat": -6.2896, "ref_lon": 106.8400, "ref_name": "Pasar Minggu",
+    "available": None, "all_venues": [], "search_done": False,
+    "last_search": {}, "geo_results": [],
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -130,12 +74,12 @@ for k, v in {
 # ─── Header ───────────────────────────────────────────────────────────────────
 
 st.title("🎾 Cari Lapangan Kosong — Jakarta")
-st.caption("Data dari ayo.co.id · Pilih parameter lalu klik **Cari Lapangan**")
-
-# ─── Form ─────────────────────────────────────────────────────────────────────
+st.caption("Data dari ayo.co.id · Atur parameter lalu klik **Cari Lapangan**")
 
 sport_opts = {7: "🎾 Tennis", 1: "⚽ Futsal", 4: "🏸 Badminton",
               8: "🏀 Basket", 12: "⚽ Mini Soccer"}
+
+# ─── Form ─────────────────────────────────────────────────────────────────────
 
 qp = st.query_params
 def qp_get(key, default, cast=str):
@@ -147,7 +91,7 @@ with st.container(border=True):
     with c1:
         hari = st.selectbox("📅 Hari", DAY_NAMES,
                             index=DAY_NAMES.index(qp_get("hari", "Rabu"))
-                                  if qp_get("hari", "Rabu") in DAY_NAMES else 2)
+                                  if qp_get("hari","Rabu") in DAY_NAMES else 2)
         target_date = next_weekday(DAY_NAMES.index(hari))
         st.caption(f"→ {target_date.strftime('%d %b %Y')}")
     with c2:
@@ -171,7 +115,6 @@ with st.container(border=True):
 # ─── Titik referensi ──────────────────────────────────────────────────────────
 
 with st.expander("📍 Titik referensi & radius", expanded=not st.session_state.search_done):
-    # Geocoding
     geo_col, _ = st.columns([3, 3])
     with geo_col:
         geo_query = st.text_input("🔍 Cari nama lokasi",
@@ -193,10 +136,8 @@ with st.expander("📍 Titik referensi & radius", expanded=not st.session_state.
     st.divider()
     rc1, rc2, rc3, rc4, rc5 = st.columns([2, 1.5, 1.5, 1.5, 1.5])
     ref_name = rc1.text_input("Nama", value=st.session_state.ref_name)
-    ref_lat  = rc2.number_input("Lat", value=st.session_state.ref_lat,
-                                format="%.5f", step=0.001)
-    ref_lon  = rc3.number_input("Lon", value=st.session_state.ref_lon,
-                                format="%.5f", step=0.001)
+    ref_lat  = rc2.number_input("Lat", value=st.session_state.ref_lat, format="%.5f", step=0.001)
+    ref_lon  = rc3.number_input("Lon", value=st.session_state.ref_lon, format="%.5f", step=0.001)
     max_km   = rc4.selectbox("Radius", [5, 10, 15, 20, 999], index=1,
                              format_func=lambda x: "Semua Jkt" if x == 999 else f"{x} km")
     if rc5.button("✔ Terapkan", width="stretch"):
@@ -205,79 +146,176 @@ with st.expander("📍 Titik referensi & radius", expanded=not st.session_state.
         st.session_state.ref_name = ref_name
         st.rerun()
 
-# ─── Opsi tampilan ────────────────────────────────────────────────────────────
-
 with st.expander("⚙️ Opsi tampilan", expanded=False):
     sort_by = st.radio("Urutkan hasil", ["📍 Jarak", "💰 Harga"], horizontal=True)
 
-max_price = 1_500_000  # no filter
-
 st.divider()
 
-# ─── Proses: catalog + availability (hanya saat klik Cari) ───────────────────
+# ─── Proses (hanya saat klik Cari) ───────────────────────────────────────────
 
 if cari_btn:
-    ref = {"lat": st.session_state.ref_lat, "lon": st.session_state.ref_lon}
+    ref      = {"lat": st.session_state.ref_lat, "lon": st.session_state.ref_lon}
     date_str = target_date.strftime("%Y-%m-%d")
+    radius_lbl = "semua Jakarta" if max_km == 999 else f"dalam {max_km} km"
 
-    # Update URL params untuk share link
-    st.query_params.update({
-        "hari": hari, "jam": str(jam_main), "dur": str(durasi),
-        "cabor": str(cabor),
-        "lat": str(round(ref["lat"], 5)), "lon": str(round(ref["lon"], 5)),
-        "km": str(max_km),
-    })
+    st.query_params.update({"hari": hari, "jam": str(jam_main), "dur": str(durasi),
+                             "cabor": str(cabor), "lat": str(round(ref["lat"],5)),
+                             "lon": str(round(ref["lon"],5)), "km": str(max_km)})
 
-    # Step 1: Catalog (cache hit = instan, miss = ~2 menit)
-    info = st.session_state.catalog_info
-    if info:
-        age_min = int((datetime.now() - datetime.fromisoformat(info["fetched_at"])).total_seconds() / 60)
-        age_str = f"{age_min} mnt lalu" if age_min < 60 else f"{age_min//60} jam lalu"
-        st.info(f"📦 Pakai cache venue ({age_str} · {info['total']} venue). Klik 🔄 untuk refresh.", icon=None)
-        catalog = load_venue_catalog(cabor)
+    # ── Fase 1: Katalog venue ─────────────────────────────────────────────────
+
+    cached_cat = catalog_from_cache(cabor)
+
+    if cached_cat:
+        all_venues = cached_cat["venues"]
+        cat_age = int(_age_seconds(st.session_state[f"cat_{cabor}"]["at"]) / 60)
+        age_str = f"{cat_age} mnt lalu" if cat_age < 60 else f"{cat_age//60} jam lalu"
+        st.success(f"📦 Katalog dari cache ({age_str}) — {cached_cat['total']} venue", icon=None)
     else:
-        prog_cat = st.progress(0.0)
-        status_cat = st.empty()
-        status_cat.markdown("**Langkah 1/2 — Memuat daftar venue Jakarta…**  \n"
-                            "_(pertama kali ~2 menit, selanjutnya instan dari cache)_")
-        catalog = load_venue_catalog(cabor)
-        prog_cat.progress(1.0)
-        status_cat.markdown(f"✅ **{catalog['total']} venue dimuat**")
+        with st.status("📦 Mengambil daftar venue Jakarta…", expanded=True) as cat_status:
 
-    st.session_state.catalog_info = {
-        "fetched_at": catalog["fetched_at"],
-        "total":      catalog["total"],
-    }
-    st.session_state.all_venues = catalog["venues"]
+            # Step A: venue list per area
+            st.write("**Step 1 dari 2 — Ambil daftar venue dari 8 area Jakarta**")
+            all_venues, seen = [], set()
+            prog_area = st.progress(0.0)
 
-    # Step 2: Filter radius
+            for i, lokasi in enumerate(JAKARTA_AREAS):
+                st.write(f"&nbsp;&nbsp;&nbsp;⟳ {lokasi}…")
+                session = make_session()
+                area_v  = get_venues_for_area(session, cabor, lokasi)
+                new     = [v for v in area_v if v["id"] not in seen]
+                seen.update(v["id"] for v in new)
+                all_venues.extend(new)
+                prog_area.progress((i + 1) / len(JAKARTA_AREAS))
+                st.write(f"&nbsp;&nbsp;&nbsp;✅ {lokasi} — **{len(new)} venue baru** (total {len(all_venues)})")
+                time.sleep(0.15)
+
+            prog_area.progress(1.0)
+
+            # Step B: koordinat (concurrent)
+            st.divider()
+            st.write(f"**Step 2 dari 2 — Ambil koordinat {len(all_venues)} venue** (5 paralel)")
+            prog_coord  = st.progress(0.0)
+            coord_text  = st.empty()
+            done_coord  = 0
+            coord_map   = {v["id"]: i for i, v in enumerate(all_venues)}
+
+            with ThreadPoolExecutor(max_workers=5) as ex:
+                futures = {ex.submit(fetch_coords_solo, dict(v)): v["id"] for v in all_venues}
+                for fut in as_completed(futures):
+                    vid = futures[fut]
+                    v_result = fut.result()
+                    all_venues[coord_map[vid]] = v_result
+                    done_coord += 1
+                    prog_coord.progress(
+                        done_coord / len(all_venues),
+                        f"[{done_coord}/{len(all_venues)}] {v_result['name'][:45]}"
+                    )
+
+            cat_data = {"venues": all_venues, "total": len(all_venues),
+                        "fetched_at": datetime.now().isoformat()}
+            save_catalog(cabor, cat_data)
+            cat_status.update(label=f"✅ Katalog siap — {len(all_venues)} venue dimuat",
+                              state="complete", expanded=False)
+
+    # ── Fase 2: Filter radius ─────────────────────────────────────────────────
+
     venues_in_radius = [
-        v for v in catalog["venues"]
+        v for v in all_venues
         if v.get("lat") and v.get("lon") and (
             max_km == 999 or
             haversine(v["lat"], v["lon"], ref["lat"], ref["lon"]) <= max_km
         )
     ]
-    n_filt    = len(venues_in_radius)
-    est_secs  = max(2, (n_filt + 4) // 5)
-    radius_lbl = "semua Jakarta" if max_km == 999 else f"dalam {max_km} km"
+    n_filt   = len(venues_in_radius)
+    est_secs = max(2, (n_filt + 4) // 5)
 
-    # Step 3: Availability check
-    prog_av = st.progress(0.0)
-    status_av = st.empty()
-    status_av.markdown(
-        f"**Langkah 2/2 — Cek ketersediaan {n_filt} venue** {radius_lbl} "
-        f"dari **{st.session_state.ref_name}** (~{est_secs}s)…"
+    st.info(
+        f"📍 **{n_filt} venue** {radius_lbl} dari **{st.session_state.ref_name}** "
+        f"akan dicek ketersediaannya (~{est_secs} detik)",
+        icon=None
     )
 
-    venues_json = json.dumps(venues_in_radius, ensure_ascii=False)
-    raw = fetch_availability(venues_json, date_str, int(jam_main),
-                             int(durasi * 2), cabor)
+    # ── Fase 3: Availability check (concurrent) ───────────────────────────────
 
-    prog_av.progress(1.0)
-    status_av.markdown(f"✅ **Selesai!** {len(raw)} lapangan tersedia.")
+    avail_hash = str(hash((
+        tuple(sorted(v["id"] for v in venues_in_radius)),
+        date_str, jam_main, int(durasi * 2), cabor
+    )))
+    cached_avail = avail_from_cache(avail_hash)
+
+    if cached_avail is not None:
+        av_age = int(_age_seconds(st.session_state[f"av_{avail_hash}"]["at"]) / 60)
+        st.success(f"⚡ Hasil availability dari cache ({av_age} mnt lalu) — {len(cached_avail)} lapangan", icon=None)
+        raw = cached_avail
+    else:
+        def check_one(v: dict):
+            s = make_session_bare()
+            fields = check_fields_flexible(s, v["id"], date_str, jam_main, durasi, cabor)
+            return v, fields
+
+        with st.status(f"🔍 Cek ketersediaan {n_filt} venue…", expanded=True) as av_status:
+            st.write(f"Hari: **{hari}** · Slot: **{jam_main-1}:00–{jam_main+1}:00** · "
+                     f"Durasi: **{durasi:g} jam** · {sport_opts[cabor]}")
+            st.write(f"Radius: **{radius_lbl}** dari **{st.session_state.ref_name}** · "
+                     f"5 venue paralel · estimasi ~{est_secs}s")
+            st.divider()
+
+            prog_av    = st.progress(0.0)
+            av_current = st.empty()
+            av_found   = st.empty()
+
+            raw         = []
+            done_av     = 0
+            found_names = []
+
+            with ThreadPoolExecutor(max_workers=5) as ex:
+                futures = {ex.submit(check_one, v): v for v in venues_in_radius}
+                for fut in as_completed(futures):
+                    v, fields = fut.result()
+                    done_av += 1
+
+                    for f in fields:
+                        url = (f"https://ayo.co.id/v/{v['slug']}?date={date_str}&field_id={f['field_id']}"
+                               if v.get("slug") else f"https://ayo.co.id/venue/{v['id']}")
+                        alt_str = ", ".join(
+                            f"{a['slot_start']:02d}:00–{a['slot_end']:02d}:00"
+                            for a in f.get("alt_slots", [])
+                        )
+                        raw.append({
+                            "venue_id": v["id"], "venue": v["name"], "area": v["area"],
+                            "lat": v["lat"], "lon": v["lon"],
+                            "field_id": f["field_id"], "field": f["field_name"],
+                            "slot": f"{f['slot_start']:02d}:00–{f['slot_end']:02d}:00",
+                            "slot_start": f["slot_start"], "price": f["price_total"],
+                            "alt_slots": alt_str, "url": url,
+                        })
+                        if v["name"] not in found_names:
+                            found_names.append(v["name"])
+
+                    prog_av.progress(
+                        done_av / n_filt,
+                        f"[{done_av}/{n_filt}] {v['name'][:45]}"
+                    )
+                    if found_names:
+                        av_found.success(
+                            "✅ Tersedia: " + " · ".join(found_names[-4:])
+                            + (f" (+{len(found_names)-4} lain)" if len(found_names) > 4 else "")
+                        )
+                    else:
+                        av_found.caption("Belum ada lapangan tersedia yang ditemukan…")
+
+            n_lap = len(raw)
+            n_ven = len(found_names)
+            av_status.update(
+                label=f"✅ Selesai — {n_lap} lapangan tersedia dari {n_ven} venue",
+                state="complete", expanded=False
+            )
+
+        save_avail(avail_hash, raw)
 
     st.session_state.available   = raw
+    st.session_state.all_venues  = all_venues
     st.session_state.search_done = True
     st.session_state.last_search = {
         "hari": hari, "jam": jam_main, "durasi": durasi,
@@ -285,33 +323,27 @@ if cari_btn:
         "ref_name": st.session_state.ref_name,
         "ref_lat": round(ref["lat"], 4), "ref_lon": round(ref["lon"], 4),
         "radius": max_km, "date_str": date_str,
-        "n_venues_checked": n_filt,
+        "n_checked": n_filt,
     }
     st.rerun()
 
 # ─── Hasil ────────────────────────────────────────────────────────────────────
 
 if st.session_state.search_done and st.session_state.available is not None:
-    ls   = st.session_state.last_search
-    ref  = {"lat": st.session_state.ref_lat, "lon": st.session_state.ref_lon}
-    avail = list(st.session_state.available)
+    ls  = st.session_state.last_search
+    ref = {"lat": st.session_state.ref_lat, "lon": st.session_state.ref_lon}
 
-    # Re-hitung jarak dari ref terkini
+    avail = list(st.session_state.available)
     for r in avail:
         if r.get("lat") and r.get("lon"):
             r["dist"] = haversine(r["lat"], r["lon"], ref["lat"], ref["lon"])
 
-    # Filter harga
-    if max_price < 1_500_000:
-        avail = [r for r in avail if r["price"] <= max_price]
-
-    # Dedup
-    seen: set = set()
+    seen_k: set = set()
     deduped: list[dict] = []
     for r in sorted(avail, key=lambda r: r.get("dist") or 9999):
         key = (r["venue_id"], r["field"].lower())
-        if key not in seen:
-            seen.add(key)
+        if key not in seen_k:
+            seen_k.add(key)
             deduped.append(r)
 
     if sort_by == "💰 Harga":
@@ -327,40 +359,29 @@ if st.session_state.search_done and st.session_state.available is not None:
              haversine(v["lat"], v["lon"], ref["lat"], ref["lon"]) <= ls["radius"])
     ]
 
-    # Info pencarian
-    radius_info = "semua Jakarta" if ls["radius"] == 999 else f"{ls['radius']} km"
-    price_info  = "" if max_price >= 1_500_000 else f" · budget ≤ Rp{max_price:,}"
-    ci = st.session_state.catalog_info
-    if ci:
-        age_min = int((datetime.now() - datetime.fromisoformat(ci["fetched_at"])).total_seconds() / 60)
-        age_str = f"{age_min} mnt lalu" if age_min < 60 else f"{age_min//60} jam lalu"
-        badge_cls = "badge badge-yellow" if age_min > 300 else "badge badge-green"
-        c_badge, c_refresh = st.columns([5, 1])
-        with c_badge:
-            st.markdown(
-                f'<span class="{badge_cls}">📦 Cache {age_str} · {ci["total"]} venue</span>'
-                f'&nbsp;&nbsp;<span style="font-size:12px;color:#666">'
-                f'{ls["hari"]} · jam ~{ls["jam"]}:00 · {ls["durasi"]:g}j · {ls["sport"]} · '
-                f'{radius_info} dari <b>{ls["ref_name"]}</b>{price_info}</span>',
-                unsafe_allow_html=True,
-            )
-        with c_refresh:
-            if st.button("🔄 Refresh Cache"):
-                load_venue_catalog.clear()
-                fetch_availability.clear()
-                st.session_state.catalog_info = None
-                st.rerun()
-
-    st.caption(
-        f"🔗 Share: `?hari={ls['hari']}&jam={ls['jam']}&dur={ls['durasi']}"
-        f"&cabor={ls['cabor']}&lat={ls['ref_lat']}&lon={ls['ref_lon']}&km={ls['radius']}`"
-    )
+    # Cache info + share link
+    col_info, col_ref = st.columns([5, 1])
+    with col_info:
+        radius_info = "semua Jakarta" if ls["radius"] == 999 else f"{ls['radius']} km"
+        st.caption(
+            f"**{ls['hari']}** · jam ~{ls['jam']}:00 · {ls['durasi']:g}j · "
+            f"{ls['sport']} · {radius_info} dari **{ls['ref_name']}**"
+        )
+        share = (f"?hari={ls['hari']}&jam={ls['jam']}&dur={ls['durasi']}&cabor={ls['cabor']}"
+                 f"&lat={ls['ref_lat']}&lon={ls['ref_lon']}&km={ls['radius']}")
+        st.caption(f"🔗 Share: `{share}`")
+    with col_ref:
+        if st.button("🔄 Hapus Cache"):
+            for k in list(st.session_state.keys()):
+                if k.startswith("cat_") or k.startswith("av_"):
+                    del st.session_state[k]
+            st.rerun()
 
     # Metrics
     mc1, mc2, mc3, mc4 = st.columns(4)
     mc1.metric("Lapangan tersedia", len(deduped))
     mc2.metric("Venue tersedia",    n_venues)
-    mc3.metric("Venue dicek",       ls["n_venues_checked"])
+    mc3.metric("Venue dicek",       ls["n_checked"])
     mc4.metric("Terdekat",
                deduped[0]["venue"][:22] if deduped else "–",
                f"{deduped[0]['dist']:.1f} km" if deduped and deduped[0].get("dist") else "")
@@ -369,23 +390,21 @@ if st.session_state.search_done and st.session_state.available is not None:
 
     # ── Peta ──────────────────────────────────────────────────────────────────
     st.subheader("🗺️ Peta")
-    st.caption("Klik marker **hijau** → jadikan titik referensi baru (tabel re-sort).")
+    st.caption("Klik marker **hijau** → set titik referensi baru, tabel re-sort otomatis.")
 
     av_lats  = [r["lat"] for r in deduped if r.get("lat")]
     av_lons  = [r["lon"] for r in deduped if r.get("lon")]
     av_hover = [
-        f"<b>{r['venue']}</b><br>{r['area']}<br>"
-        f"🏅 {r['field']}<br>🕖 {r['slot']}"
+        f"<b>{r['venue']}</b><br>{r['area']}<br>🏅 {r['field']}<br>🕖 {r['slot']}"
         + (f"<br><span style='color:#888'>juga: {r['alt_slots']}</span>" if r.get("alt_slots") else "")
-        + f"<br>💰 Rp{r['price']:,}<br>📍 {r.get('dist', 0):.1f} km"
+        + f"<br>💰 Rp{r['price']:,}<br>📍 {r.get('dist',0):.1f} km"
         for r in deduped if r.get("lat")
     ]
 
     fig = go.Figure()
     if na_in_radius:
         fig.add_trace(go.Scattermap(
-            lat=[v["lat"] for v in na_in_radius],
-            lon=[v["lon"] for v in na_in_radius],
+            lat=[v["lat"] for v in na_in_radius], lon=[v["lon"] for v in na_in_radius],
             mode="markers", marker=dict(size=7, color="#bbb", opacity=0.4),
             text=[v["name"] for v in na_in_radius],
             hovertemplate="<b>%{text}</b><br>Tidak tersedia<extra></extra>",
@@ -427,9 +446,8 @@ if st.session_state.search_done and st.session_state.available is not None:
 
     # ── Tabel ─────────────────────────────────────────────────────────────────
     st.subheader(f"📋 {len(deduped)} lapangan dari {n_venues} venue")
-
     if not deduped:
-        st.info("Tidak ada lapangan tersedia. Coba perluas radius, ganti jam, atau naikkan budget.")
+        st.info("Tidak ada lapangan tersedia. Coba perluas radius atau ganti jam.")
     else:
         df = pd.DataFrame([{
             "Jarak":     f"{r['dist']:.1f} km" if r.get("dist") else "–",
@@ -442,28 +460,24 @@ if st.session_state.search_done and st.session_state.available is not None:
             "Booking":   r["url"],
         } for r in deduped])
 
-        st.dataframe(
-            df, hide_index=True,
-            column_config={
-                "Booking":   st.column_config.LinkColumn("Booking", display_text="Buka →"),
-                "Jarak":     st.column_config.TextColumn(width="small"),
-                "Slot":      st.column_config.TextColumn(width="small"),
-                "Slot lain": st.column_config.TextColumn("Slot lain", width="medium",
-                                                         help="Slot alternatif yang juga kosong"),
-                "Harga":     st.column_config.TextColumn(width="small"),
-                "Area":      st.column_config.TextColumn(width="medium"),
-            },
-        )
+        st.dataframe(df, hide_index=True, column_config={
+            "Booking":   st.column_config.LinkColumn("Booking", display_text="Buka →"),
+            "Jarak":     st.column_config.TextColumn(width="small"),
+            "Slot":      st.column_config.TextColumn(width="small"),
+            "Slot lain": st.column_config.TextColumn("Slot lain", width="medium",
+                                                     help="Slot alternatif yang juga kosong"),
+            "Harga":     st.column_config.TextColumn(width="small"),
+            "Area":      st.column_config.TextColumn(width="medium"),
+        })
 
 else:
-    # Belum ada search — tampilkan onboarding
     st.markdown("""
-    ### Cara pakai
-    1. **Pilih hari** dan **jam** yang diinginkan di atas
-    2. **Set titik referensi** (default: Pasar Minggu) di bagian 📍 — bisa ketik nama atau isi koordinat
-    3. Pilih **radius** pencarian (default 10 km)
-    4. Klik **🔍 Cari Lapangan**
+### Cara pakai
+1. Pilih **hari** dan **sekitar jam berapa** mau main
+2. Set **titik referensi** (default Pasar Minggu) — bisa cari nama atau isi koordinat manual
+3. Pilih **radius** (default 10 km dari titik referensi)
+4. Klik **🔍 Cari Lapangan**
 
-    > Pertama kali klik Cari: ~2 menit (ambil data semua venue Jakarta).
-    > Pencarian berikutnya: langsung dari cache, cek availability ~3–6 detik.
-    """)
+> **Pertama kali:** ~2–3 menit (ambil semua venue Jakarta + koordinatnya)
+> **Selanjutnya:** instan dari cache — cek availability ~3–6 detik
+""")
