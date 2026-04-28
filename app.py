@@ -207,12 +207,10 @@ with st.expander("📍 Titik referensi & radius", expanded=not st.session_state.
 
 # ─── Opsi tampilan ────────────────────────────────────────────────────────────
 
-with st.expander("⚙️ Opsi tampilan & filter", expanded=False):
-    oc1, oc2 = st.columns(2)
-    sort_by   = oc1.radio("Urutkan", ["📍 Jarak", "💰 Harga"], horizontal=True)
-    max_price = oc2.slider("💰 Budget max",
-                           0, 1_500_000, 1_500_000, step=50_000,
-                           format_func=lambda x: "Semua" if x >= 1_500_000 else f"Rp{x:,}")
+with st.expander("⚙️ Opsi tampilan", expanded=False):
+    sort_by = st.radio("Urutkan hasil", ["📍 Jarak", "💰 Harga"], horizontal=True)
+
+max_price = 1_500_000  # no filter
 
 st.divider()
 
