@@ -1,7 +1,7 @@
 """
 ayo.co.id scraper module — semua logic fetch/check, no UI.
 """
-# v2
+# v3
 
 import html as html_lib
 import math
